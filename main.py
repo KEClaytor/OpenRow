@@ -38,19 +38,23 @@ display = adafruit_is31fl3731.CharlieWing(i2c)
 class scrollingDisplay():
     def __init__(self):
         self.d = [0]*12
-        frame = 0
+        self.f = 0
 
-    def update(self, value):
+    def update(self, v):
         self.d.pop(0)
-        self.d.append(value)
+        value = 0 if v < 0 else v
+        self.d.append(value + 1)
+        print(self.d)
         # Update the frame
         frame = self.f
         display.frame(frame, show=False)
         display.fill(0)
-        for x in range(1, 13):
-            for y in range(1, self.d[x]):
-                if y < display.height:
-                    display.pixel(x, y, 50)
+        for ii in range(12):
+            value = self.d[ii]
+            for jj in range(value+1):
+                x = ii
+                y = display.height - jj
+                display.pixel(x, y, 20)
         display.frame(frame, show=True)
         frame = 0 if frame else 1
         self.f = frame
