@@ -4,9 +4,72 @@
 import time
 import board
 import busio
+import storage
 
+import digitalio
 import adafruit_gps
+import adafruit_sdcard
+import adafruit_lis3dh
+import adafruit_framebuf
+import adafruit_is31fl3731
 
+# Configure LIS3DH Accelerometer
+i2c = busio.I2C(board.SCL, board.SDA)
+int1 = None # digitalio.DigitalInOut(board.D6)  # Set this to the correct pin for the interrupt!
+lis3dh = adafruit_lis3dh.LIS3DH_I2C(i2c, int1=int1)
+# Set range of accelerometer (can be RANGE_2_G, RANGE_4_G, RANGE_8_G or RANGE_16_G).
+lis3dh.range = adafruit_lis3dh.RANGE_2_G
+
+# Configure SD Card
+spi = busio.SPI(board.SCK, MOSI=board.MOSI, MISO=board.MISO)
+cs = digitalio.DigitalInOut(board.D10)
+
+sdcard = adafruit_sdcard.SDCard(spi, cs)
+vfs = storage.VfsFat(sdcard)
+storage.mount(vfs, "/sd")
+
+# Configure DisplayBonnet
+display = adafruit_is31fl3731.CharlieWing(i2c)
+
+#while True:
+#    if lis3dh.shake(shake_threshold=12):
+#        print("Shaken!")
+
+class scrollingDisplay():
+    def __init__(self):
+        self.d = [0]*12
+        frame = 0
+
+    def update(self, value):
+        self.d.pop(0)
+        self.d.append(value)
+        # Update the frame
+        frame = self.f
+        display.frame(frame, show=False)
+        display.fill(0)
+        for x in range(1, 13):
+            for y in range(1, self.d[x]):
+                if y < display.height:
+                    display.pixel(x, y, 50)
+        display.frame(frame, show=True)
+        frame = 0 if frame else 1
+        self.f = frame
+
+sd = scrollingDisplay()
+while True:
+    x, y, z = lis3dh.acceleration
+    a_mag = (x**2 + y**2 + z**2)**0.5
+    G = a_mag / adafruit_lis3dh.STANDARD_GRAVITY
+    # print(G)
+    Gpx = int((G - 1)*6/1)
+    print(G, Gpx)
+    sd.update(Gpx)
+    # print("writing")
+    # with open("/sd/test.txt", "a") as f:
+    #     f.write("%0.1f\n" % Gpx)
+    # print("done")
+    # Small delay to keep things responsive but give time for interrupt processing.
+    time.sleep(0.1)
 
 # Define RX and TX pins for the board's serial port connected to the GPS.
 # These are the defaults you should use for the GPS FeatherWing.
