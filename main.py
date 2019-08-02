@@ -75,7 +75,7 @@ class scrollingDisplay():
 
     def update_g(self, g):
         self.dg.pop(0)
-        gpx = int((g - 1)*4/1)
+        gpx = int((g - 1)/0.5 * 4)
         if gpx > 4:
             gpx = 4
         elif gpx < 0:
@@ -87,7 +87,7 @@ class scrollingDisplay():
         self.ds.append(s)
 
     def update_b(self, b):
-        db = int((b-3.3)/3.7 * 7)
+        db = int((b-3.3)/(3.7-3.3) * 7)
         self.b = db
 
     def draw_frame(self):
@@ -122,23 +122,30 @@ class scrollingDisplay():
 
 sd = scrollingDisplay()
 # Find the number of files in the directory
-# nfiles = len(os.listdir("/sd"))
-# filename = "/sd/data_{}.txt".format(nfiles+1)
+nfiles = len(os.listdir("/sd"))
+filename = "data_{}.txt".format(nfiles+1)
 
 # Wait until we have a fix
-while True:
-    gps.update()
-    if not gps.has_fix:
-        # Try again if we don't have a fix yet.
-        print('Waiting for fix...')
-        time.sleep(1)
-        continue
-    else:
-        print("Fix acquired.")
-        break
+start_time = time.monotonic()
+with open("/sd/gps.txt", "w") as f:
+    while True:
+        sentence = uart.readline()
+        print(str(sentence, 'ascii').strip())
+        f.write(sentence)
+        gps.update()
+        elapsed = time.monotonic() - start_time
+        if not gps.has_fix:
+            print('Waiting for fix (%ds)...' % elapsed)
+            if gps.fix_quality:
+                print('    quality: %f' % gps.fix_quality)
+            time.sleep(1)
+            continue
+        else:
+            print("Fix acquired in %ds." % elapsed)
+            break
 
-# Use the date as a filename
-filename = "{}-{}-{}T{:02}:{:02}".format(
+# # Use the date as a filename
+filename = "{}-{}-{}T{:02}{:02}.csv".format(
             gps.timestamp_utc.tm_year,
             gps.timestamp_utc.tm_mon,
             gps.timestamp_utc.tm_mday,
@@ -147,15 +154,16 @@ filename = "{}-{}-{}T{:02}:{:02}".format(
             )
 
 # Only log for a specified duration
-duration = 10
+duration = 60
 start_time = time.monotonic()
-with open(filename, "w") as f:
+with open("/sd/" + filename, "w") as f:
     # Write header
     print("Logging...")
-    f.write("time,battery,g,shaken,latitude,longitude,quality,satellites,altitude,speed,track_angle,horizontal_dilution\n")
+    f.write("gps_time,time,battery,g,shaken,latitude,longitude,quality,satellites,altitude,speed,track_angle\n")
     while True:
         # Wait until we have a fix
         gps.update()
+        t = time.monotonic()
 
         if not gps.has_fix:
             # Try again if we don't have a fix yet.
@@ -179,7 +187,7 @@ with open(filename, "w") as f:
         x, y, z = lis3dh.acceleration
         a_mag = (x**2 + y**2 + z**2)**0.5
         G = a_mag / adafruit_lis3dh.STANDARD_GRAVITY
-        shaken = lis3dh.shake(shake_threshold=12)
+        shaken = lis3dh.shake(shake_threshold=11)
         sd.update_g(G)
         sd.update_s(shaken)
         sd.update_b(v_batt)
@@ -188,9 +196,9 @@ with open(filename, "w") as f:
         sd.draw_frame()
 
         # Start writing to the file
-        f.write("%s,%f,%f,%d,%f,%f,%f," %
+        f.write("%s,%f,%f,%f,%d,%f,%f,%f," %
             (
-                time_str, v_batt, G, shaken,
+                time_str, t, v_batt, G, shaken,
                 gps.latitude, gps.longitude, gps.fix_quality,
             )
         )
@@ -207,16 +215,11 @@ with open(filename, "w") as f:
         else:
             f.write("None,")
         if gps.track_angle_deg is not None:
-            f.write("%f," % gps.track_angle_deg)
-        else:
-            f.write("None,")
-        if gps.horizontal_dilution is not None:
-            f.write("%f" % gps.horizontal_dilution)
+            f.write("%f" % gps.track_angle_deg)
         else:
             f.write("None")
         f.write("\n")
 
-        # Write to SD card
         # Small delay to keep things responsive but give time for interrupt processing.
         time.sleep(0.1)
 
