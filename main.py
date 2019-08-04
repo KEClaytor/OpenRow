@@ -1,6 +1,7 @@
 
 import os
 import time
+import math
 import random
 
 import board
@@ -16,7 +17,7 @@ import adafruit_framebuf
 import adafruit_is31fl3731
 import adafruit_ht16k33.segments
 
-# Battery pin
+# Battepy pin
 vbat_pin = analogio.AnalogIn(board.VOLTAGE_MONITOR)
 
 def get_voltage():
@@ -58,9 +59,9 @@ segment.show()
 ## Configure GPS ##
 ###################
 
-# Define RX and TX pins for the board's serial port connected to the GPS.
+# Define px and TX pins for the board's serial port connected to the GPS.
 # These are the defaults you should use for the GPS FeatherWing.
-# For other boards set RX = GPS module TX, and TX = GPS module RX pins.
+# For other boards set px = GPS module TX, and TX = GPS module px pins.
 RX = board.RX
 TX = board.TX
 
@@ -79,6 +80,44 @@ gps.send_command(b'PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0')
 # Set update rate to once a second (1hz) which is what you typically want.
 gps.send_command(b'PMTK220,1000')
 
+#################
+## Vector Math ##
+#################
+def vector_mean(vector_list):
+    """ Average a list of 3-vectors
+
+    [(x1, y1, z1), ..., (xn, yn, zn)] -> (xm, ym, zm)
+    """
+    vlen = len(vector_list)
+    mv = tuple(
+        sum(v[ii] for v in vector_list) / vlen for ii in range(3)
+    )
+    return mv
+
+def vector_multiply(s, v):
+    """ Multiply a vector by a scalar
+    """
+    return tuple(s * vi for vi in v)
+
+def vector_subtract(va, vb):
+    """ Vector version of a - b
+    """
+    return tuple(a - b for a, b in zip(va, vb))
+
+def dot(xv, yv):
+    """ Dot product: xv.yv
+    """
+    return sum(x*y for x, y in zip(xv, yv))
+
+def norm(v):
+    """ Euclidean norm: sqrt(v.v)
+    """
+    mv = math.sqrt(dot(v, v))
+    if mv == 0.0:
+        return (0, 0, 0)
+    else:
+        return tuple(vi/mv for vi in v)
+
 #############
 ## Classes ##
 #############
@@ -95,7 +134,7 @@ class ScrollingDisplay():
     """ Main class for storing values and updating the display
     """
     def __init__(self):
-        # History length
+        # Histopy length
         self.hlen = 10
         # Acceleration
         self.disp_g = [0]*self.hlen
@@ -113,7 +152,7 @@ class ScrollingDisplay():
 
     def update_g(self, g):
         self.disp_g.pop(0)
-        gpx = int((g - 1)*4/0.5)
+        gpx = int((g - 1)*4/1.5)
         if gpx > 4:
             gpx = 4
         elif gpx < 0:
@@ -137,7 +176,7 @@ class ScrollingDisplay():
             - Current G's pulled (scrolling bar)
             - Mode (letter)
             - GPS fix
-            - Battery fraction
+            - Battepy fraction
         '''
         frame = self.f
         display.frame(frame, show=False)
@@ -154,7 +193,7 @@ class ScrollingDisplay():
             if self.disp_s[ii]:
                 display.pixel(x, 0, 50)
 
-        # Display the battery fraction
+        # Display the battepy fraction
         for jj in range(self.b):
             x = 14
             y = display.height - jj
@@ -192,56 +231,132 @@ class ScrollingDisplay():
         frame = 0 if frame else 1
         self.f = frame
 
-class StrokeCounter():
-    """ Compute stroke rate
+
+##############
+## Closures ##
+##############
+
+
+def GravityRemover(history=5):
+    """ Track and remove the average component of N acceleration vectors
+
+    Internally track the last N accleration vectors.
+    Compute the average acceleration vector from these.
+    Then subtract that from the current acceleration vector.
+    And return this reduced acceleration vector.
     """
+    hv = []
+    def _call(v):
 
-    def __init__(self):
-        # TODO: Adjustable
-        self.threshold = 1.2
-        self.n_strokes = 3
-        # Final result we want
-        self.rate = 0
-        # History
-        self.strokes = []
-        self.stimes = []
+        if len(hv) < 1:
+            v_reduced = (0, 0, 0)
+        else:
+            # Compute the direction of average acceleration
+            a_hat = norm(vector_mean(hv))
+            # Remove the component parallel to average accleration
+            v_parallel = vector_multiply(dot(v, a_hat), a_hat)
+            v_reduced = vector_subtract(v, v_parallel)
+        # Update the histopy elements with the new vector
+        hv.append(v)
+        if len(hv) > history:
+            hv.pop(0)
+        return v_reduced
 
-    def _calculate_rate(self):
-        strokes = len(self.strokes)
-        if strokes > 1:
-            time = self.stimes[-1] - self.stimes[0]
-            # strokes / time [s] * 60 [s]/minute
-            self.rate = round(60 * strokes / time, 1)
+    return _call
 
-    def update(self, stroke):
 
+def HistoryThresholder(threshold=1, history=5, mode="rising"):
+    """ Pulse when something exceeds our threshold
+    But maintain a history with hystersis so we don't accidentally trigger.
+    """
+    if mode == "rising":
+        comparitor = lambda x, y: x > y
+    elif mode == "falling":
+        comparitor = lambda x, y: x < y
+    else:
+        raise ValueError("mode can be 'rising' or 'falling'")
+
+    previous = []
+    def _call(value):
+        condition_met = comparitor(value, threshold)
+        if condition_met and not any(previous):
+            trigger = True
+        else:
+            trigger = False
+        previous.append(condition_met)
+        if len(previous) > history:
+            previous.pop(0)
+        return trigger
+
+    return _call
+
+
+def StrokeRate(history=3, forget=120):
+    """ Compute stroke rate
+    Inputs:
+        history = remember this many strokes
+        forget = forget strokes older than this time
+    """
+    # A single value becomes a local variable
+    stroke_rate = [0]
+    stroke_times = []
+    def _call(stroke):
+        currently = time.monotonic()
+        # Drop old measurements
+        if stroke_times:
+            if (currently - stroke_times[0]) > forget:
+                stroke_times.pop(0)
+        # Add new measurements
         if stroke:
-            self.strokes.append(stroke)
-            self.stimes.append(time.monotonic())
+            stroke_times.append(currently)
+            if len(stroke_times) > history:
+                stroke_times.pop(0)
+        # Update our rate
+        strokes = len(stroke_times)
+        if strokes > 1:
+            delta_t = stroke_times[-1] - stroke_times[0]
+            # strokes / delta_t [s] * 60 [s]/minute
+            stroke_rate[0] = round(60 * strokes / delta_t, 1)
+        else:
+            stroke_rate[0] = 0
+        return stroke_rate[0]
 
-        if len(self.strokes) > self.n_strokes:
-            self.strokes.pop(0)
-            self.stimes.pop(0)
+    return _call
 
-        self._calculate_rate()
 
-        segment.print(self.rate)
-
-sd = ScrollingDisplay()
-sc = StrokeCounter()
-
-# Find the number of files in the directory
-nfiles = len(os.listdir("/sd"))
-filename = "row_{}.csv".format(nfiles+1)
-
-def write_header(filename):
-    print("Starting log file")
-    with open("/sd/" + filename, "w") as f:
-        f.write("gps_time,time,battery,g,shaken,latitude,longitude,quality,satellites,altitude,speed,track_angle\n")
+###############
+## Functions ##
+###############
 
 def format_log(*args):
     log = ",".join([str(a) for a in args]) + "\n"
     return log
+
+def write_header(filename):
+    print("Starting log file")
+    header = format_log(
+        "gps_time",
+        "time",
+        "battery_voltage",
+        "ax",
+        "ay",
+        "az",
+        "a_magnitude",
+        "px",
+        "py",
+        "pz",
+        "a_perpendicular",
+        "shaken",
+        "latitude",
+        "longitude",
+        "fix_quality",
+        "satellites",
+        "altitude_m",
+        "speed_knots",
+        "track_angle_deg",
+    )
+    with open("/sd/" + filename, "w") as f:
+        f.write(header)
 
 
 def write_data(filename, log):
@@ -262,11 +377,24 @@ def write_data(filename, log):
         display.pixel(x, y, 0)
     print("Written")
 
-# Only log for a specified duration
+
+##########
+## MAIN ##
+##########
+
+multidisplay = ScrollingDisplay()
+accleration_fixer = GravityRemover()
+stroke_computer = HistoryThresholder()
+rate_computer = StrokeRate()
+
+# Find the number of files in the directopy
+nfiles = len(os.listdir("/sd"))
+filename = "row_{}.csv".format(nfiles+1)
+write_header(filename)
+
 log = ""
 last_time = time.monotonic()
 gps.update()
-write_header(filename)
 while True:
     # Wait until we have a fix
     t = time.monotonic()
@@ -288,31 +416,43 @@ while True:
     else:
         gps_time = None
 
-    # Get battery voltage
-    v_batt = get_voltage()
+    # Get battepy voltage
+    battery_voltage = get_voltage()
 
     # Now get acceleration
-    x, y, z = lis3dh.acceleration
-    a_mag = (x**2 + y**2 + z**2)**0.5
-    G = a_mag / adafruit_lis3dh.STANDARD_GRAVITY
-    shaken = lis3dh.shake(shake_threshold=11)
+    a_vec = lis3dh.acceleration
+    a_magnitude_squared = dot(a_vec, a_vec)
+    # Compute the perpendicular vector
+    p_vec = accleration_fixer(a_vec)
+    p_magnitude_squared = dot(p_vec, p_vec)
+
+    # Determine if we have a stroke and update the rate
+    stroke = stroke_computer(p_magnitude_squared)
+    rate = rate_computer(stroke)
 
     # Update the display
-    sd.update_g(G)
-    sd.update_stroke(shaken)
-    sd.update_battery(v_batt)
-    sd.update_fix(gps.has_fix)
-    sd.draw_frame()
+    multidisplay.update_g(p_magnitude_squared)
+    multidisplay.update_stroke(stroke)
+    multidisplay.update_battery(battery_voltage)
+    multidisplay.update_fix(gps.has_fix)
+    multidisplay.draw_frame()
+    segment.print(rate)
 
-    # Update stroke rate
-    sc.update(shaken)
-
+    # Append to the log
+    ax, ay, az = a_vec
+    px, py, pz = p_vec
     log += format_log(
         gps_time,
-        t,
-        v_batt,
-        G,
-        shaken,
+        time,
+        battery_voltage,
+        ax,
+        ay,
+        az,
+        a_magnitude_squared,
+        px,
+        py,
+        pz,
+        p_magnitude_squared,
         gps.latitude,
         gps.longitude,
         gps.fix_quality,
@@ -322,6 +462,7 @@ while True:
         gps.track_angle_deg,
     )
 
+    # If we have enough data write the log and reset it
     if len(log) > 2048:
         write_data(filename, log)
         log = ""
