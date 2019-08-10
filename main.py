@@ -118,10 +118,33 @@ def norm(v):
     else:
         return tuple(vi/mv for vi in v)
 
+##############
+## Geo Math ##
+##############
+
+def calculate_distance(lat0, lon0, lat1, lon1):
+    """ Compute distance in m between to latitude and longitude points
+
+    Approximation only, good if
+        1. the points are not separated too much (we're talking km usually)
+        2. you are not near the poles
+    """
+    deglen = 111.1*1e3
+    x = lat1 - lat0
+    y = (lon1 - lon0)*math.cos(lat0*math.pi/180)
+    d = deglen*math.sqrt(x*x + y*y)
+    return d
+
 #############
 ## Classes ##
 #############
 
+# GPS Indicator pixels
+Gx = [10, 11, 12, 13]
+Gy = [0, 0, 0, 0]
+# DIsk write indicator pixels
+Wx = [10, 11, 12, 13]
+Wy = [1, 1, 1, 1]
 # Letters for the display
 Sy = [2, 2, 3, 4, 4, 4, 5, 6, 6]
 Sx = [12, 13, 11, 11, 12, 13, 13, 11, 12]
@@ -142,8 +165,16 @@ class ScrollingDisplay():
         self.disp_s = [0]*self.hlen
         # Do we have GPS?
         self.fix = False
-        # Display mode
-        self.mode = "k"
+        # Display modes and tracking index
+        self.mi = 0
+        self.modes = ["k", "s", "d"]
+        # Switch display modes this many seconds
+        self.dt = 5
+        self.mt = time.monotonic()
+        # Current stats
+        self.rate = 0
+        self.split = 0
+        self.distance = 0
         # Frame number (alternates between 0 and 1)
         # Allows us to write the next frame without display
         self.f = 0
@@ -152,20 +183,25 @@ class ScrollingDisplay():
 
     def update_g(self, g):
         self.disp_g.pop(0)
-        gpx = int((g - 1)*4/1.5)
+        gpx = int((g - 1)*4/40.0)
         if gpx > 4:
             gpx = 4
         elif gpx < 0:
             gpx = 0
         self.disp_g.append(gpx + 1)
 
+    def update_stats(self, rate, split, distance):
+        self.rate = rate
+        self.split = split
+        self.distance = distance
+
     def update_stroke(self, stroke):
         self.disp_s.pop(0)
         self.disp_s.append(stroke)
 
     def update_battery(self, battery_voltage):
-        battery_display_height = int((battery_voltage-3.3)/(3.7-3.3) * display.height)
-        self.b = battery_display_height
+        # Convert battery voltage to display height in pixels
+        self.b = int((battery_voltage-3.3)/(3.7-3.3) * display.height)
 
     def update_fix(self, gps_fix):
         self.fix = gps_fix
@@ -178,6 +214,8 @@ class ScrollingDisplay():
             - GPS fix
             - Battepy fraction
         '''
+        currently = time.monotonic()
+
         frame = self.f
         display.frame(frame, show=False)
         display.fill(0)
@@ -201,20 +239,24 @@ class ScrollingDisplay():
 
         # Display the mode:
         # Split (S), Distance (D), or Stroke (K) rate
-        if self.mode == "s":
+        mode = self.modes[self.mi]
+        if mode == "s":
             X, Y = Sx, Sy
-            pass
-        elif self.mode == "d":
+            segment.print(self.split)
+        elif mode == "d":
             X, Y = Dx, Dy
-            pass
-        elif self.mode == "k":
+            segment.print(self.distance)
+        elif mode == "k":
             X, Y = Kx, Ky
+            segment.print(self.rate)
         for x, y in zip(X, Y):
             display.pixel(x, y, 20)
+        # Do we need to change modes?
+        if (currently - self.mt) > self.dt:
+            self.mi = (self.mi + 1) % 3
+            self.mt = currently
 
         # Display the GPS fix
-        Gx = [10, 11, 12, 13]
-        Gy = [0, 0, 0, 0]
         if self.fix:
             for x, y in zip(Gx, Gy):
                 display.pixel(x, y, 20)
@@ -265,61 +307,102 @@ def GravityRemover(history=5):
     return _call
 
 
-def HistoryThresholder(threshold=1, history=5, mode="rising"):
-    """ Pulse when something exceeds our threshold
-    But maintain a history with hystersis so we don't accidentally trigger.
+def HistoryThresholder(threshold=20.0, mode="rising"):
+    """ Pulse when something exceeds our threshold and we're on a rising edge
     """
     if mode == "rising":
-        comparitor = lambda x, y: x > y
+        comparitor = lambda x0, x1, thresh: x1 > thresh and x0 < thresh
     elif mode == "falling":
-        comparitor = lambda x, y: x < y
+        comparitor = lambda x0, x1, thresh: x1 < thresh and x0 > thresh
     else:
-        raise ValueError("mode can be 'rising' or 'falling'")
+        raise TypeError("mode can be 'rising' or 'falling'")
 
-    previous = []
+    previous = [0, 0]
     def _call(value):
-        condition_met = comparitor(value, threshold)
-        if condition_met and not any(previous):
-            trigger = True
-        else:
-            trigger = False
-        previous.append(condition_met)
-        if len(previous) > history:
-            previous.pop(0)
-        return trigger
+        previous.append(value)
+        previous.pop(0)
+
+        return comparitor(previous[0], previous[1], threshold)
 
     return _call
 
 
-def StrokeRate(history=3, forget=120):
+def StrokeRate(history_num=3, history_time=20):
     """ Compute stroke rate
+
+    We want a fairly updated (instaneous) stroke rate
+    But we also don't want to compute rates from strokes separated by a long time.
     Inputs:
-        history = remember this many strokes
-        forget = forget strokes older than this time
+        history_num = Drop more than history_num strokes
+        history_time = Drop strokes older than this time
+    Internally:
+        stroke_data = List of tuples [(time, distance)]
     """
     # A single value becomes a local variable
-    stroke_rate = [0]
-    stroke_times = []
-    def _call(stroke):
+    stroke_data = []
+
+    def _call(stroke, distance):
+        """ Update the stroke data and return current rate and split.
+            stroke = has a stroke occured?
+            distance = current distance travelled
+        """
         currently = time.monotonic()
-        # Drop old measurements
-        if stroke_times:
-            if (currently - stroke_times[0]) > forget:
-                stroke_times.pop(0)
-        # Add new measurements
+
+        # Only update the data on a stroke event
         if stroke:
-            stroke_times.append(currently)
-            if len(stroke_times) > history:
-                stroke_times.pop(0)
+            stroke_data.append((currently, distance))
+
+        # Drop points based on number
+        while len(stroke_data) > history_num:
+            stroke_data.pop(0)
+
+        # Drop points based on time
+        while stroke_data and (currently - stroke_data[0][0] > history_time):
+            stroke_data.pop(0)
+
         # Update our rate
-        strokes = len(stroke_times)
+        strokes = len(stroke_data)
         if strokes > 1:
-            delta_t = stroke_times[-1] - stroke_times[0]
-            # strokes / delta_t [s] * 60 [s]/minute
-            stroke_rate[0] = round(60 * strokes / delta_t, 1)
+            time0, dist0 = stroke_data[0]
+            time1, dist1 = stroke_data[-1]
+            delta_t = time1 - time0
+            delta_d = dist1 - dist0
+
+            # Stroke rate = strokes / delta_t [s] * 60 [s]/minute
+            stroke_rate = round(60 * strokes / delta_t, 1)
+
+            # Split = time for 500 m
+            if delta_d > 0:
+                split_time = 500.0 * delta_t / delta_d
+            else:
+                split_time = 0
         else:
-            stroke_rate[0] = 0
-        return stroke_rate[0]
+            stroke_rate, split_time = 0, 0
+
+        return (stroke_rate, split_time)
+
+    return _call
+
+
+def DistanceTracker():
+    """ Compute our running distance
+    """
+    ilat = [None, None]
+    ilon = [None, None]
+    total_distance = 0
+
+    def _call(lat, lon):
+        # Update the lat / lon arrays
+        ilat.append(lat)
+        ilat.pop(0)
+        ilon.append(lon)
+        ilon.pop(0)
+
+        if ilat[0] is not None and ilat[1] is not None:
+            new_distance = calculate_distance(ilat[0], ilon[0], ilat[1], ilon[1])
+            total_distance += new_distance
+
+        return total_distance
 
     return _call
 
@@ -361,9 +444,6 @@ def write_header(filename):
 
 def write_data(filename, log):
     print("Writing to log...")
-    # Display the GPS fix
-    Wx = [10, 11, 12, 13]
-    Wy = [1, 1, 1, 1]
     # Turn on write indicator
     for x, y in zip(Wx, Wy):
         display.pixel(x, y, 70)
@@ -384,6 +464,7 @@ def write_data(filename, log):
 
 multidisplay = ScrollingDisplay()
 accleration_fixer = GravityRemover()
+distance_tracker = DistanceTracker()
 stroke_computer = HistoryThresholder()
 rate_computer = StrokeRate()
 
@@ -406,6 +487,8 @@ while True:
 
     if gps.has_fix:
         # We have a fix!
+        distance = distance_tracker(gps.latitude, gps.longitude)
+
         gps_time = "{}/{}/{} {:02}:{:02}:{:02}".format(
             gps.timestamp_utc.tm_year,  # Grab parts of the time from the
             gps.timestamp_utc.tm_mon,   # struct_time object that holds
@@ -414,6 +497,7 @@ while True:
             gps.timestamp_utc.tm_min,   # month!
             gps.timestamp_utc.tm_sec)
     else:
+        distance = distance_tracker(None, None)
         gps_time = None
 
     # Get battepy voltage
@@ -428,15 +512,15 @@ while True:
 
     # Determine if we have a stroke and update the rate
     stroke = stroke_computer(p_magnitude_squared)
-    rate = rate_computer(stroke)
+    rate, split = rate_computer(stroke, distance)
 
     # Update the display
     multidisplay.update_g(p_magnitude_squared)
     multidisplay.update_stroke(stroke)
     multidisplay.update_battery(battery_voltage)
     multidisplay.update_fix(gps.has_fix)
+    multidisplay.update_stats(rate, split, distance)
     multidisplay.draw_frame()
-    segment.print(rate)
 
     # Append to the log
     ax, ay, az = a_vec
