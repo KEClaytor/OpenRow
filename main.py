@@ -17,6 +17,9 @@ import adafruit_framebuf
 import adafruit_is31fl3731
 import adafruit_ht16k33.segments
 
+import rowing
+import vector
+
 # Battepy pin
 vbat_pin = analogio.AnalogIn(board.VOLTAGE_MONITOR)
 
@@ -80,60 +83,6 @@ gps.send_command(b'PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0')
 # Set update rate to once a second (1hz) which is what you typically want.
 gps.send_command(b'PMTK220,1000')
 
-#################
-## Vector Math ##
-#################
-def vector_mean(vector_list):
-    """ Average a list of 3-vectors
-
-    [(x1, y1, z1), ..., (xn, yn, zn)] -> (xm, ym, zm)
-    """
-    vlen = len(vector_list)
-    mv = tuple(
-        sum(v[ii] for v in vector_list) / vlen for ii in range(3)
-    )
-    return mv
-
-def vector_multiply(s, v):
-    """ Multiply a vector by a scalar
-    """
-    return tuple(s * vi for vi in v)
-
-def vector_subtract(va, vb):
-    """ Vector version of a - b
-    """
-    return tuple(a - b for a, b in zip(va, vb))
-
-def dot(xv, yv):
-    """ Dot product: xv.yv
-    """
-    return sum(x*y for x, y in zip(xv, yv))
-
-def norm(v):
-    """ Euclidean norm: sqrt(v.v)
-    """
-    mv = math.sqrt(dot(v, v))
-    if mv == 0.0:
-        return (0, 0, 0)
-    else:
-        return tuple(vi/mv for vi in v)
-
-##############
-## Geo Math ##
-##############
-
-def calculate_distance(lat0, lon0, lat1, lon1):
-    """ Compute distance in m between to latitude and longitude points
-
-    Approximation only, good if
-        1. the points are not separated too much (we're talking km usually)
-        2. you are not near the poles
-    """
-    deglen = 111.1*1e3
-    x = lat1 - lat0
-    y = (lon1 - lon0)*math.cos(lat0*math.pi/180)
-    d = deglen*math.sqrt(x*x + y*y)
-    return d
 
 #############
 ## Classes ##
@@ -214,7 +163,7 @@ class ScrollingDisplay():
             - GPS fix
             - Battepy fraction
         '''
-        currently = time.monotonic()
+        seconds = time.monotonic()
 
         frame = self.f
         display.frame(frame, show=False)
@@ -252,9 +201,9 @@ class ScrollingDisplay():
         for x, y in zip(X, Y):
             display.pixel(x, y, 20)
         # Do we need to change modes?
-        if (currently - self.mt) > self.dt:
+        if (seconds - self.mt) > self.dt:
             self.mi = (self.mi + 1) % 3
-            self.mt = currently
+            self.mt = seconds
 
         # Display the GPS fix
         if self.fix:
@@ -272,139 +221,6 @@ class ScrollingDisplay():
         # Cycle to the next frame to draw in the background
         frame = 0 if frame else 1
         self.f = frame
-
-
-##############
-## Closures ##
-##############
-
-
-def GravityRemover(history=5):
-    """ Track and remove the average component of N acceleration vectors
-
-    Internally track the last N accleration vectors.
-    Compute the average acceleration vector from these.
-    Then subtract that from the current acceleration vector.
-    And return this reduced acceleration vector.
-    """
-    hv = []
-    def _call(v):
-
-        if len(hv) < 1:
-            v_reduced = (0, 0, 0)
-        else:
-            # Compute the direction of average acceleration
-            a_hat = norm(vector_mean(hv))
-            # Remove the component parallel to average accleration
-            v_parallel = vector_multiply(dot(v, a_hat), a_hat)
-            v_reduced = vector_subtract(v, v_parallel)
-        # Update the histopy elements with the new vector
-        hv.append(v)
-        if len(hv) > history:
-            hv.pop(0)
-        return v_reduced
-
-    return _call
-
-
-def HistoryThresholder(threshold=20.0, mode="rising"):
-    """ Pulse when something exceeds our threshold and we're on a rising edge
-    """
-    if mode == "rising":
-        comparitor = lambda x0, x1, thresh: x1 > thresh and x0 < thresh
-    elif mode == "falling":
-        comparitor = lambda x0, x1, thresh: x1 < thresh and x0 > thresh
-    else:
-        raise TypeError("mode can be 'rising' or 'falling'")
-
-    previous = [0, 0]
-    def _call(value):
-        previous.append(value)
-        previous.pop(0)
-
-        return comparitor(previous[0], previous[1], threshold)
-
-    return _call
-
-
-def StrokeRate(history_num=3, history_time=20):
-    """ Compute stroke rate
-
-    We want a fairly updated (instaneous) stroke rate
-    But we also don't want to compute rates from strokes separated by a long time.
-    Inputs:
-        history_num = Drop more than history_num strokes
-        history_time = Drop strokes older than this time
-    Internally:
-        stroke_data = List of tuples [(time, distance)]
-    """
-    # A single value becomes a local variable
-    stroke_data = []
-
-    def _call(stroke, distance):
-        """ Update the stroke data and return current rate and split.
-            stroke = has a stroke occured?
-            distance = current distance travelled
-        """
-        currently = time.monotonic()
-
-        # Only update the data on a stroke event
-        if stroke:
-            stroke_data.append((currently, distance))
-
-        # Drop points based on number
-        while len(stroke_data) > history_num:
-            stroke_data.pop(0)
-
-        # Drop points based on time
-        while stroke_data and (currently - stroke_data[0][0] > history_time):
-            stroke_data.pop(0)
-
-        # Update our rate
-        strokes = len(stroke_data)
-        if strokes > 1:
-            time0, dist0 = stroke_data[0]
-            time1, dist1 = stroke_data[-1]
-            delta_t = time1 - time0
-            delta_d = dist1 - dist0
-
-            # Stroke rate = strokes / delta_t [s] * 60 [s]/minute
-            stroke_rate = round(60 * strokes / delta_t, 1)
-
-            # Split = time for 500 m
-            if delta_d > 0:
-                split_time = 500.0 * delta_t / delta_d
-            else:
-                split_time = 0
-        else:
-            stroke_rate, split_time = 0, 0
-
-        return (stroke_rate, split_time)
-
-    return _call
-
-
-def DistanceTracker():
-    """ Compute our running distance
-    """
-    ilat = [None, None]
-    ilon = [None, None]
-    total_distance = 0
-
-    def _call(lat, lon):
-        # Update the lat / lon arrays
-        ilat.append(lat)
-        ilat.pop(0)
-        ilon.append(lon)
-        ilon.pop(0)
-
-        if ilat[0] is not None and ilat[1] is not None:
-            new_distance = calculate_distance(ilat[0], ilon[0], ilat[1], ilon[1])
-            total_distance += new_distance
-
-        return total_distance
-
-    return _call
 
 
 ###############
@@ -429,7 +245,10 @@ def write_header(filename):
         "py",
         "pz",
         "a_perpendicular",
-        "shaken",
+        "stroke",
+        "rate",
+        "split",
+        "distance",
         "latitude",
         "longitude",
         "fix_quality",
@@ -463,10 +282,10 @@ def write_data(filename, log):
 ##########
 
 multidisplay = ScrollingDisplay()
-accleration_fixer = GravityRemover()
-distance_tracker = DistanceTracker()
-stroke_computer = HistoryThresholder()
-rate_computer = StrokeRate()
+accleration_fixer = rowing.GravityRemover()
+distance_tracker = rowing.DistanceTracker()
+stroke_computer = rowing.HistoryThresholder()
+rate_computer = rowing.StrokeRate()
 
 # Find the number of files in the directopy
 nfiles = len(os.listdir("/sd"))
@@ -474,20 +293,22 @@ filename = "row_{}.csv".format(nfiles+1)
 write_header(filename)
 
 log = ""
+distance = 0
 last_time = time.monotonic()
 gps.update()
 while True:
     # Wait until we have a fix
-    t = time.monotonic()
-    if t - last_time > 1:
+    seconds = time.monotonic()
+    random_delay = 2*random.random() + 1
+    if seconds - last_time > random_delay:
         sentence = uart.readline()
         print(str(sentence, 'ascii').strip())
         gps.update()
-        last_time = t
+        last_time = seconds
 
     if gps.has_fix:
         # We have a fix!
-        distance = distance_tracker(gps.latitude, gps.longitude)
+        distance += distance_tracker(gps.latitude, gps.longitude)
 
         gps_time = "{}/{}/{} {:02}:{:02}:{:02}".format(
             gps.timestamp_utc.tm_year,  # Grab parts of the time from the
@@ -497,7 +318,7 @@ while True:
             gps.timestamp_utc.tm_min,   # month!
             gps.timestamp_utc.tm_sec)
     else:
-        distance = distance_tracker(None, None)
+        distance += distance_tracker(None, None)
         gps_time = None
 
     # Get battepy voltage
@@ -505,14 +326,14 @@ while True:
 
     # Now get acceleration
     a_vec = lis3dh.acceleration
-    a_magnitude_squared = dot(a_vec, a_vec)
+    a_magnitude_squared = vector.dot(a_vec, a_vec)
     # Compute the perpendicular vector
     p_vec = accleration_fixer(a_vec)
-    p_magnitude_squared = dot(p_vec, p_vec)
+    p_magnitude_squared = vector.dot(p_vec, p_vec)
 
     # Determine if we have a stroke and update the rate
     stroke = stroke_computer(p_magnitude_squared)
-    rate, split = rate_computer(stroke, distance)
+    rate, split = rate_computer(stroke, seconds, distance)
 
     # Update the display
     multidisplay.update_g(p_magnitude_squared)
@@ -527,7 +348,7 @@ while True:
     px, py, pz = p_vec
     log += format_log(
         gps_time,
-        time,
+        seconds,
         battery_voltage,
         ax,
         ay,
@@ -537,6 +358,10 @@ while True:
         py,
         pz,
         p_magnitude_squared,
+        stroke,
+        rate,
+        split,
+        distance,
         gps.latitude,
         gps.longitude,
         gps.fix_quality,
